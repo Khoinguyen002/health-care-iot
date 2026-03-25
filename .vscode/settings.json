@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "npm install": true,
+        "/^cd /home/khoi-nguyen/Documents/health-care-iot/health-care-be && node src/server\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd /home/khoi-nguyen/Documents/health-care-iot/health-care-be && node --check src/server\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

@@ -1,0 +1,147 @@
+import { useMemo, useState, type FormEvent } from "react";
+import { PPGCanvas } from "./components/PPGCanvas";
+import { useSensorData } from "./hooks/useSensorData";
+
+const WS_URL = import.meta.env.VITE_WS_URL || "http://localhost:3001";
+
+function App() {
+  const [deviceInput, setDeviceInput] = useState("ESP_001");
+  const {
+    latest,
+    spo2Series,
+    bpmSeries,
+    ppgChunk,
+    connectionState,
+    error,
+    connectToDevice,
+    disconnect,
+    isConnected,
+    deviceId,
+  } = useSensorData(WS_URL);
+
+  const statusLabel = useMemo(() => {
+    if (connectionState === "connected") return "Connected";
+    if (connectionState === "connecting") return "Connecting";
+    if (connectionState === "error") return "Error";
+    return "Idle";
+  }, [connectionState]);
+
+  const onConnect = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    connectToDevice(deviceInput);
+  };
+
+  const spo2Value = latest?.spo2 ?? "--";
+  const bpmValue = latest?.bpm ?? "--";
+  const dotClass =
+    connectionState === "connected"
+      ? "bg-lime-700"
+      : connectionState === "connecting"
+        ? "bg-amber-600"
+        : connectionState === "error"
+          ? "bg-red-600"
+          : "bg-slate-400";
+
+  return (
+    <main className="grid gap-4">
+      <header className="space-y-1">
+        <p className="m-0 text-xs font-semibold uppercase tracking-[0.08em] text-lime-700">
+          Real-time Health Dashboard
+        </p>
+        <h1 className="m-0 font-sans text-3xl font-bold text-slate-900 md:text-4xl">
+          Sensor - UDP - Gateway - Web
+        </h1>
+        <p className="m-0 max-w-prose text-sm md:text-base">
+          Theo doi nhiet sinh hoc theo thoi gian thuc cho tung node ESP32.
+        </p>
+      </header>
+
+      <section className="grid gap-3 rounded-2xl border border-lime-200 bg-lime-50/70 p-4 shadow-sm">
+        <form
+          onSubmit={onConnect}
+          className="grid grid-cols-1 items-center gap-2 md:grid-cols-[120px_1fr_auto_auto]"
+        >
+          <label
+            htmlFor="device_id"
+            className="text-sm font-medium text-slate-700"
+          >
+            device_id
+          </label>
+          <input
+            id="device_id"
+            value={deviceInput}
+            onChange={(event) => setDeviceInput(event.target.value)}
+            placeholder="ESP_001"
+            className="w-full rounded-xl border border-lime-200 bg-white px-3 py-2 font-mono text-sm outline-none ring-lime-300 focus:ring"
+          />
+          <button
+            type="submit"
+            className="rounded-xl border border-amber-700 bg-amber-400 px-3 py-2 text-sm font-semibold text-amber-950"
+          >
+            Connect
+          </button>
+          <button
+            type="button"
+            className="rounded-xl border border-lime-300 bg-lime-100 px-3 py-2 text-sm font-semibold text-lime-900"
+            onClick={disconnect}
+          >
+            Disconnect
+          </button>
+        </form>
+
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+          <span
+            className={`inline-block h-2.5 w-2.5 rounded-full ${dotClass}`}
+          />
+          <strong>{statusLabel}</strong>
+          <span>Gateway: {WS_URL}</span>
+          <span>Device: {deviceId || "N/A"}</span>
+        </div>
+
+        {error ? <p className="m-0 text-sm text-red-700">{error}</p> : null}
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+          <p className="m-0 text-sm text-slate-600">SpO2</p>
+          <p className="m-0 font-mono text-5xl leading-none text-slate-900">
+            {spo2Value}
+          </p>
+          <p className="m-0 text-sm text-slate-600">%</p>
+          <p className="m-0 text-sm text-slate-600">
+            {spo2Series.length} diem da luu
+          </p>
+        </article>
+        <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+          <p className="m-0 text-sm text-slate-600">Heart Rate</p>
+          <p className="m-0 font-mono text-5xl leading-none text-slate-900">
+            {bpmValue}
+          </p>
+          <p className="m-0 text-sm text-slate-600">BPM</p>
+          <p className="m-0 text-sm text-slate-600">
+            {bpmSeries.length} diem da luu
+          </p>
+        </article>
+      </section>
+
+      <section className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+        <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
+          <h2 className="m-0 text-xl font-semibold text-slate-900">
+            PPG Signal
+          </h2>
+          <p className="m-0 text-sm">
+            {isConnected ? "Dang nhan goi tin lien tuc" : "Chua ket noi sensor"}
+          </p>
+        </div>
+        <PPGCanvas
+          chunk={ppgChunk}
+          width={1100}
+          height={300}
+          maxSamples={1600}
+        />
+      </section>
+    </main>
+  );
+}
+
+export default App;
