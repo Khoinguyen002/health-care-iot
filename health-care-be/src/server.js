@@ -5,7 +5,6 @@ const http = require('node:http');
 const express = require('express');
 const cors = require('cors');
 const { Server } = require('socket.io');
-const OpenAI = require('openai');
 const Redis = require('ioredis');
 
 const UDP_PORT = Number(process.env.UDP_PORT || 41234);
@@ -15,9 +14,15 @@ const AI_EVAL_INTERVAL_MS = Number(process.env.AI_EVAL_INTERVAL_MS || 30000);
 const AI_WINDOW_MS = Number(process.env.AI_WINDOW_MS || 120000);
 const AI_MIN_POINTS = Number(process.env.AI_MIN_POINTS || 10);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 50);
-const AI_MODEL = process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const AI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const REDIS_URL = process.env.REDIS_URL || '';
+
+function normalizeGeminiModelName(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return 'models/gemini-2.5-flash';
+  return raw.startsWith('models/') ? raw : `models/${raw}`;
+}
 
 function maskSecret(secret) {
   if (!secret) return '(empty)';
@@ -25,15 +30,61 @@ function maskSecret(secret) {
   return `${secret.slice(0, 6)}...${secret.slice(-4)}`;
 }
 
-const openrouterClient = OPENROUTER_API_KEY
-  ? new OpenAI({
-      baseURL: 'https://openrouter.ai/api/v1',
-      apiKey: OPENROUTER_API_KEY,
-      defaultHeaders: {
-        'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost',
-        'X-Title': process.env.OPENROUTER_APP_NAME || 'health-care-iot',
+const geminiClient = GEMINI_API_KEY
+  ? {
+      async generate(prompt) {
+        const modelPath = normalizeGeminiModelName(AI_MODEL);
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(
+            GEMINI_API_KEY
+          )}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: 'user',
+                  parts: [{ text: prompt }],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.2,
+              },
+            }),
+          }
+        );
+
+        if (!response.ok) {
+          const body = await response.text();
+          throw new Error(`gemini generateContent failed ${response.status}: ${body}`);
+        }
+
+        const data = await response.json();
+        const content = (data?.candidates?.[0]?.content?.parts || [])
+          .map((part) => String(part?.text || ''))
+          .join('\n')
+          .trim();
+
+        return content;
       },
-    })
+      async getCurrent() {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+            GEMINI_API_KEY
+          )}`
+        );
+
+        if (!response.ok) {
+          const body = await response.text();
+          throw new Error(`gemini models failed ${response.status}: ${body}`);
+        }
+
+        return response.json();
+      },
+    }
   : null;
 
 const redisClient = REDIS_URL
@@ -71,12 +122,12 @@ if (redisClient) {
 }
 
 console.log('[ai] config', {
-  enabled: Boolean(openrouterClient),
+  enabled: Boolean(geminiClient),
   model: AI_MODEL,
   evalIntervalMs: AI_EVAL_INTERVAL_MS,
   windowMs: AI_WINDOW_MS,
   minPoints: AI_MIN_POINTS,
-  key: maskSecret(OPENROUTER_API_KEY),
+  key: maskSecret(GEMINI_API_KEY),
 });
 
 console.log('[redis] config', {
@@ -207,6 +258,27 @@ function addReadingForAnalysis(reading) {
   recentReadingsByDevice.set(deviceId, list);
 }
 
+function clearEvaluatedReadings(deviceId, evaluatedTs) {
+  const list = recentReadingsByDevice.get(deviceId);
+  if (!list || !list.length) return;
+
+  const beforeLen = list.length;
+  const filtered = list.filter((r) => Number(r.gateway_ts || 0) > evaluatedTs);
+
+  console.log('[ai] clear evaluated readings', {
+    deviceId,
+    evaluatedTs,
+    removed: beforeLen - filtered.length,
+    remaining: filtered.length,
+  });
+
+  if (filtered.length === 0) {
+    recentReadingsByDevice.delete(deviceId);
+  } else {
+    recentReadingsByDevice.set(deviceId, filtered);
+  }
+}
+
 function summarizeWindow(readings) {
   const spo2 = readings.map((r) => r.spo2).filter(Number.isFinite);
   const bpm = readings.map((r) => r.bpm).filter(Number.isFinite);
@@ -242,7 +314,7 @@ function extractJsonBlock(raw) {
 function createPrompt(deviceId, summary) {
   return [
     `Device: ${deviceId}`,
-    `Summary 30s: ${JSON.stringify(summary)}`,
+    `Summary ${AI_EVAL_INTERVAL_MS / 1000}s: ${JSON.stringify(summary)}`,
     'Assess health status from bpm/spo2/ppg quality and provide diagnosis, warnings, and recommendations.',
     'Return strict JSON with fields:',
     '{"status":"stable|warning|critical","confidence":0-1,"summary":"...","diagnosis":"...","warnings":["..."],"recommendations":["..."],"findings":["..."]}',
@@ -290,33 +362,34 @@ async function evaluateDevice(deviceId, readings) {
     deviceId,
     samples: summary.sample_count,
     spo2_count: summary.spo2_count,
+    spo2_range: [summary.spo2_min, summary.spo2_max],
     bpm_count: summary.bpm_count,
+    bpm_range: [summary.bpm_min, summary.bpm_max],
     ppg_count: summary.ppg_count,
   });
 
-  if (!openrouterClient) {
-    console.warn('[ai] openrouter disabled, using fallback', { deviceId });
+  if (!geminiClient) {
+    console.warn('[ai] gemini disabled, using fallback', { deviceId });
     return fallbackAssessment(deviceId, summary);
   }
 
   try {
-    const completion = await openrouterClient.chat.completions.create({
-      model: AI_MODEL,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are a clinical monitoring assistant. Respond with JSON only. No markdown.',
-        },
-        {
-          role: 'user',
-          content: createPrompt(deviceId, summary),
-        },
-      ],
+    console.log('[ai] payload to send', {
+      deviceId,
+      spo2_min: summary.spo2_min,
+      spo2_max: summary.spo2_max,
+      spo2_mean: summary.spo2_mean,
+      bpm_min: summary.bpm_min,
+      bpm_max: summary.bpm_max,
+      bpm_mean: summary.bpm_mean,
     });
 
-    const content = completion.choices?.[0]?.message?.content || '';
+    const content = await geminiClient.generate(
+      [
+        'You are a clinical monitoring assistant. Respond with JSON only. No markdown.',
+        createPrompt(deviceId, summary),
+      ].join('\n\n')
+    );
     const jsonText = extractJsonBlock(content);
     if (!jsonText) {
       return fallbackAssessment(deviceId, summary);
@@ -363,7 +436,7 @@ async function evaluateDevice(deviceId, readings) {
 
     return result;
   } catch (error) {
-    console.error('[ai] openrouter error:', error?.message || error);
+    console.error('[ai] gemini error:', error?.message || error);
     return fallbackAssessment(deviceId, summary);
   }
 }
@@ -403,6 +476,10 @@ async function runAiEvaluationTick() {
 
       await persistAssessment(deviceId, assessment);
       io.to(`device:${deviceId}`).emit('ai-assessment', assessment);
+      
+      // Clear all readings that were part of this evaluation, keep only NEW readings
+      clearEvaluatedReadings(deviceId, lastTs);
+      
       console.log('[ai] emitted assessment', {
         deviceId,
         status: assessment.status,
@@ -502,8 +579,21 @@ udpServer.on('message', (msg, rinfo) => {
   addReadingForAnalysis(reading);
 });
 
-udpServer.bind(UDP_PORT, () => {
+udpServer.bind(UDP_PORT, async () => {
   const address = udpServer.address();
+
+  try {
+    const keyInfo = await geminiClient?.getCurrent();
+    const modelCount = Array.isArray(keyInfo?.models) ? keyInfo.models.length : 0;
+    if (keyInfo) {
+      console.log('[gemini] key probe success', {
+        modelCount,
+        sampleModels: (keyInfo.models || []).slice(0, 3).map((m) => m.name),
+      });
+    }
+  } catch (error) {
+    console.error('[gemini] key probe failed:', error?.message || error);
+  }
 
   setInterval(runAiEvaluationTick, AI_EVAL_INTERVAL_MS);
   console.log('[ai] scheduler started', { everyMs: AI_EVAL_INTERVAL_MS });
