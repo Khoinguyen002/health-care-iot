@@ -123,65 +123,67 @@ function App() {
         </article>
       </section>
 
-      <section className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
-        <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
-          <h2 className="m-0 text-xl font-semibold text-slate-900">
-            PPG Signal
-          </h2>
-          <p className="m-0 text-sm">
-            {isConnected ? "Receiving live packets" : "Sensor not connected"}
-          </p>
-        </div>
-        <PPGCanvas
-          chunk={ppgChunk}
-          width={1100}
-          height={300}
-          maxSamples={1600}
-        />
-      </section>
+      <section className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+          <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
+            <h2 className="m-0 text-xl font-semibold text-slate-900">
+              PPG Signal
+            </h2>
+            <p className="m-0 text-sm">
+              {isConnected ? "Receiving live packets" : "Sensor not connected"}
+            </p>
+          </div>
+          <PPGCanvas
+            chunk={ppgChunk}
+            width={1100}
+            height={300}
+            maxSamples={1600}
+          />
+        </article>
 
-      <section className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
-        <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
-          <h2 className="m-0 text-xl font-semibold text-slate-900">
-            AI Assessment History
-          </h2>
-        </div>
+        <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+          <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
+            <h2 className="m-0 text-xl font-semibold text-slate-900">
+              AI Assessment History
+            </h2>
+          </div>
 
-        <div className="grid gap-2">
-          {aiHistory.length === 0 ? (
-            <p className="m-0 text-sm text-slate-600">No assessment records yet.</p>
-          ) : (
-            aiHistory.map((item, index) => (
-              <article
-                key={`${item.ts}-${index}`}
-                className={`rounded-xl border px-3 py-2 ${statusTone(item.status)}`}
-              >
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-                  <strong>{item.status.toUpperCase()}</strong>
-                  <span>confidence: {Math.round((item.confidence || 0) * 100)}%</span>
-                  <span>{new Date(item.ts).toLocaleTimeString()}</span>
-                </div>
-                <p className="m-0 mt-1 text-sm">
-                  <strong>Diagnosis:</strong> {item.diagnosis || item.summary}
-                </p>
-                {Array.isArray(item.warnings) && item.warnings.length > 0 ? (
-                  <p className="m-0 mt-1 text-xs opacity-90">
-                    <strong>Warnings:</strong> {item.warnings.slice(0, 3).join(" | ")}
+          <div className="grid max-h-90 gap-2 overflow-y-auto pr-1">
+            {aiHistory.length === 0 ? (
+              <p className="m-0 text-sm text-slate-600">No assessment records yet.</p>
+            ) : (
+              aiHistory.map((item, index) => (
+                <article
+                  key={`${item.ts}-${index}`}
+                  className={`rounded-xl border px-3 py-2 ${statusTone(item.status)}`}
+                >
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                    <strong>{item.status.toUpperCase()}</strong>
+                    <span>confidence: {Math.round((item.confidence || 0) * 100)}%</span>
+                    <span>{new Date(item.ts).toLocaleTimeString()}</span>
+                  </div>
+                  <p className="m-0 mt-1 text-sm">
+                    <strong>Diagnosis:</strong> {item.diagnosis || item.summary}
                   </p>
-                ) : Array.isArray(item.findings) && item.findings.length > 0 ? (
-                  <p className="m-0 mt-1 text-xs opacity-80">
-                    <strong>Warnings:</strong> {item.findings.slice(0, 3).join(" | ")}
-                  </p>
-                ) : null}
-                {Array.isArray(item.recommendations) && item.recommendations.length > 0 ? (
-                  <p className="m-0 mt-1 text-xs opacity-90">
-                    <strong>Recommendations:</strong> {item.recommendations.slice(0, 3).join(" | ")}
-                  </p>
-                ) : null}
-              </article>
-            ))
-          )}
-        </div>
+                  {Array.isArray(item.warnings) && item.warnings.length > 0 ? (
+                    <p className="m-0 mt-1 text-xs opacity-90">
+                      <strong>Warnings:</strong> {item.warnings.slice(0, 3).join(" | ")}
+                    </p>
+                  ) : Array.isArray(item.findings) && item.findings.length > 0 ? (
+                    <p className="m-0 mt-1 text-xs opacity-80">
+                      <strong>Warnings:</strong> {item.findings.slice(0, 3).join(" | ")}
+                    </p>
+                  ) : null}
+                  {Array.isArray(item.recommendations) && item.recommendations.length > 0 ? (
+                    <p className="m-0 mt-1 text-xs opacity-90">
+                      <strong>Recommendations:</strong> {item.recommendations.slice(0, 3).join(" | ")}
+                    </p>
+                  ) : null}
+                </article>
+              ))
+            )}
+          </div>
+        </article>
       </section>
     </main>
   );
