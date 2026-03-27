@@ -17,7 +17,7 @@ pnpm-debug.log*
 !.env.example
 
 # Node.js / frontend-backend build artifacts
-node_modules/
+**/node_modules/
 dist/
 build/
 coverage/
