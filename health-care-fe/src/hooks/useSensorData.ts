@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import type { SensorPacket, VitalPoint } from "../types/sensor";
+import type { AIAssessment, SensorPacket, VitalPoint } from "../types/sensor";
 
 type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
 const MAX_VITAL_POINTS = 240;
+const MAX_AI_HISTORY = 50;
 
 const pushPoint = (arr: VitalPoint[], point: VitalPoint): VitalPoint[] => {
   const next = [...arr, point];
@@ -24,6 +25,7 @@ export function useSensorData(serverUrl: string) {
   const [spo2Series, setSpo2Series] = useState<VitalPoint[]>([]);
   const [bpmSeries, setBpmSeries] = useState<VitalPoint[]>([]);
   const [ppgChunk, setPpgChunk] = useState<number[]>([]);
+  const [aiHistory, setAiHistory] = useState<AIAssessment[]>([]);
 
   const disconnect = useCallback(() => {
     socketRef.current?.disconnect();
@@ -35,7 +37,7 @@ export function useSensorData(serverUrl: string) {
     (nextDeviceId: string) => {
       const trimmed = nextDeviceId.trim();
       if (!trimmed) {
-        setError("device_id khong duoc de trong");
+        setError("device_id must not be empty");
         return;
       }
 
@@ -46,6 +48,7 @@ export function useSensorData(serverUrl: string) {
       setSpo2Series([]);
       setBpmSeries([]);
       setPpgChunk([]);
+      setAiHistory([]);
 
       socketRef.current?.disconnect();
 
@@ -62,12 +65,12 @@ export function useSensorData(serverUrl: string) {
 
       socket.on("connect_error", (err) => {
         setConnectionState("error");
-        setError(err.message || "Khong the ket noi den gateway");
+        setError(err.message || "Cannot connect to gateway");
       });
 
       socket.on("gateway-error", (payload: { message?: string }) => {
         setConnectionState("error");
-        setError(payload?.message || "Loi tu gateway");
+        setError(payload?.message || "Gateway error");
       });
 
       socket.on("sensor-data", (packet: SensorPacket) => {
@@ -75,15 +78,34 @@ export function useSensorData(serverUrl: string) {
         setPpgChunk(Array.isArray(packet.ppg) ? packet.ppg : []);
 
         const ts = Number(packet.ts || Date.now());
-        const spo2 = Number(packet.spo2);
-        const bpm = Number(packet.bpm);
+        const spo2 =
+          typeof packet.spo2 === "number" && Number.isFinite(packet.spo2)
+            ? packet.spo2
+            : null;
+        const bpm =
+          typeof packet.bpm === "number" && Number.isFinite(packet.bpm)
+            ? packet.bpm
+            : null;
 
-        if (Number.isFinite(spo2)) {
+        if (spo2 !== null) {
           setSpo2Series((curr) => pushPoint(curr, { ts, value: spo2 }));
         }
-        if (Number.isFinite(bpm)) {
+        if (bpm !== null) {
           setBpmSeries((curr) => pushPoint(curr, { ts, value: bpm }));
         }
+      });
+
+      socket.on(
+        "ai-history",
+        (payload: { device_id?: string; items?: AIAssessment[] }) => {
+          const items = Array.isArray(payload?.items) ? payload.items : [];
+          setAiHistory(items.slice(0, MAX_AI_HISTORY));
+        },
+      );
+
+      socket.on("ai-assessment", (item: AIAssessment) => {
+        if (!item || typeof item !== "object") return;
+        setAiHistory((curr) => [item, ...curr].slice(0, MAX_AI_HISTORY));
       });
 
       socket.on("disconnect", () => {
@@ -110,6 +132,7 @@ export function useSensorData(serverUrl: string) {
     spo2Series,
     bpmSeries,
     ppgChunk,
+    aiHistory,
     error,
     connectionState,
     isConnected,

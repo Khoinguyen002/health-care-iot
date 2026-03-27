@@ -8,9 +8,8 @@ function App() {
   const [deviceInput, setDeviceInput] = useState("ESP_001");
   const {
     latest,
-    spo2Series,
-    bpmSeries,
     ppgChunk,
+    aiHistory,
     connectionState,
     error,
     connectToDevice,
@@ -42,6 +41,12 @@ function App() {
           ? "bg-red-600"
           : "bg-slate-400";
 
+  const statusTone = (status: "stable" | "warning" | "critical") => {
+    if (status === "critical") return "border-red-200 bg-red-50 text-red-900";
+    if (status === "warning") return "border-amber-200 bg-amber-50 text-amber-900";
+    return "border-lime-200 bg-lime-50 text-lime-900";
+  };
+
   return (
     <main className="grid gap-4">
       <header className="space-y-1">
@@ -52,7 +57,7 @@ function App() {
           Sensor - UDP - Gateway - Web
         </h1>
         <p className="m-0 max-w-prose text-sm md:text-base">
-          Theo doi nhiet sinh hoc theo thoi gian thuc cho tung node ESP32.
+          Monitor real-time biosignals for each ESP32 node.
         </p>
       </header>
 
@@ -65,7 +70,7 @@ function App() {
             htmlFor="device_id"
             className="text-sm font-medium text-slate-700"
           >
-            device_id
+            Device ID
           </label>
           <input
             id="device_id"
@@ -108,9 +113,6 @@ function App() {
             {spo2Value}
           </p>
           <p className="m-0 text-sm text-slate-600">%</p>
-          <p className="m-0 text-sm text-slate-600">
-            {spo2Series.length} diem da luu
-          </p>
         </article>
         <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
           <p className="m-0 text-sm text-slate-600">Heart Rate</p>
@@ -118,9 +120,6 @@ function App() {
             {bpmValue}
           </p>
           <p className="m-0 text-sm text-slate-600">BPM</p>
-          <p className="m-0 text-sm text-slate-600">
-            {bpmSeries.length} diem da luu
-          </p>
         </article>
       </section>
 
@@ -130,7 +129,7 @@ function App() {
             PPG Signal
           </h2>
           <p className="m-0 text-sm">
-            {isConnected ? "Dang nhan goi tin lien tuc" : "Chua ket noi sensor"}
+            {isConnected ? "Receiving live packets" : "Sensor not connected"}
           </p>
         </div>
         <PPGCanvas
@@ -139,6 +138,50 @@ function App() {
           height={300}
           maxSamples={1600}
         />
+      </section>
+
+      <section className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+        <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
+          <h2 className="m-0 text-xl font-semibold text-slate-900">
+            AI Assessment History
+          </h2>
+        </div>
+
+        <div className="grid gap-2">
+          {aiHistory.length === 0 ? (
+            <p className="m-0 text-sm text-slate-600">No assessment records yet.</p>
+          ) : (
+            aiHistory.map((item, index) => (
+              <article
+                key={`${item.ts}-${index}`}
+                className={`rounded-xl border px-3 py-2 ${statusTone(item.status)}`}
+              >
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                  <strong>{item.status.toUpperCase()}</strong>
+                  <span>confidence: {Math.round((item.confidence || 0) * 100)}%</span>
+                  <span>{new Date(item.ts).toLocaleTimeString()}</span>
+                </div>
+                <p className="m-0 mt-1 text-sm">
+                  <strong>Diagnosis:</strong> {item.diagnosis || item.summary}
+                </p>
+                {Array.isArray(item.warnings) && item.warnings.length > 0 ? (
+                  <p className="m-0 mt-1 text-xs opacity-90">
+                    <strong>Warnings:</strong> {item.warnings.slice(0, 3).join(" | ")}
+                  </p>
+                ) : Array.isArray(item.findings) && item.findings.length > 0 ? (
+                  <p className="m-0 mt-1 text-xs opacity-80">
+                    <strong>Warnings:</strong> {item.findings.slice(0, 3).join(" | ")}
+                  </p>
+                ) : null}
+                {Array.isArray(item.recommendations) && item.recommendations.length > 0 ? (
+                  <p className="m-0 mt-1 text-xs opacity-90">
+                    <strong>Recommendations:</strong> {item.recommendations.slice(0, 3).join(" | ")}
+                  </p>
+                ) : null}
+              </article>
+            ))
+          )}
+        </div>
       </section>
     </main>
   );

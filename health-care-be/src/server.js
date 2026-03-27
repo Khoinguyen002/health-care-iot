@@ -1,12 +1,88 @@
+require('dotenv').config();
+
 const dgram = require('node:dgram');
 const http = require('node:http');
 const express = require('express');
 const cors = require('cors');
 const { Server } = require('socket.io');
+const OpenAI = require('openai');
+const Redis = require('ioredis');
 
 const UDP_PORT = Number(process.env.UDP_PORT || 41234);
 const WS_PORT = Number(process.env.WS_PORT || 3001);
 const MAX_PACKET_SIZE = Number(process.env.MAX_PACKET_SIZE || 65535);
+const AI_EVAL_INTERVAL_MS = Number(process.env.AI_EVAL_INTERVAL_MS || 30000);
+const AI_WINDOW_MS = Number(process.env.AI_WINDOW_MS || 120000);
+const AI_MIN_POINTS = Number(process.env.AI_MIN_POINTS || 10);
+const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 50);
+const AI_MODEL = process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const REDIS_URL = process.env.REDIS_URL || '';
+
+function maskSecret(secret) {
+  if (!secret) return '(empty)';
+  if (secret.length <= 10) return '***';
+  return `${secret.slice(0, 6)}...${secret.slice(-4)}`;
+}
+
+const openrouterClient = OPENROUTER_API_KEY
+  ? new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey: OPENROUTER_API_KEY,
+      defaultHeaders: {
+        'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost',
+        'X-Title': process.env.OPENROUTER_APP_NAME || 'health-care-iot',
+      },
+    })
+  : null;
+
+const redisClient = REDIS_URL
+  ? new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+      lazyConnect: true,
+    })
+  : null;
+
+if (redisClient) {
+  redisClient.on('error', (err) => {
+    console.error('[redis] error:', err.message);
+  });
+
+  redisClient.on('connect', () => {
+    console.log('[redis] tcp connected');
+  });
+
+  redisClient.on('ready', () => {
+    console.log('[redis] ready');
+  });
+
+  redisClient.on('reconnecting', () => {
+    console.warn('[redis] reconnecting');
+  });
+
+  redisClient.on('end', () => {
+    console.warn('[redis] connection ended');
+  });
+
+  redisClient.connect().catch((err) => {
+    console.error('[redis] connect failed:', err.message);
+  });
+}
+
+console.log('[ai] config', {
+  enabled: Boolean(openrouterClient),
+  model: AI_MODEL,
+  evalIntervalMs: AI_EVAL_INTERVAL_MS,
+  windowMs: AI_WINDOW_MS,
+  minPoints: AI_MIN_POINTS,
+  key: maskSecret(OPENROUTER_API_KEY),
+});
+
+console.log('[redis] config', {
+  enabled: Boolean(redisClient),
+  url: REDIS_URL ? `${REDIS_URL.slice(0, 20)}...` : '(empty)',
+});
 
 const app = express();
 app.use(cors());
@@ -20,14 +96,329 @@ const io = new Server(httpServer, {
 });
 
 const udpServer = dgram.createSocket('udp4');
+const recentReadingsByDevice = new Map();
+const lastEvalTsByDevice = new Map();
+const memoryHistoryByDevice = new Map();
+let aiEvalInProgress = false;
 
 // socketId -> subscribed deviceId
 const subscriptions = new Map();
 
+function hasActiveSubscriber(deviceId) {
+  const room = io.sockets.adapter.rooms.get(`device:${deviceId}`);
+  return Boolean(room && room.size > 0);
+}
+
+const average = (arr) => arr.reduce((sum, value) => sum + value, 0) / arr.length;
+
+const stdDev = (arr) => {
+  if (!arr.length) return 0;
+  const mean = average(arr);
+  const variance = arr.reduce((sum, value) => sum + (value - mean) ** 2, 0) / arr.length;
+  return Math.sqrt(variance);
+};
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const percentile = (arr, p) => {
+  if (!arr.length) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = clamp(Math.floor((sorted.length - 1) * p), 0, sorted.length - 1);
+  return sorted[idx];
+};
+
+function toNullableFiniteNumber(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function historyKey(deviceId) {
+  return `health:ai:history:${deviceId}`;
+}
+
+function pushLimitedHistory(deviceId, item) {
+  const current = memoryHistoryByDevice.get(deviceId) || [];
+  current.unshift(item);
+  memoryHistoryByDevice.set(deviceId, current.slice(0, AI_MAX_HISTORY));
+}
+
+async function persistAssessment(deviceId, assessment) {
+  pushLimitedHistory(deviceId, assessment);
+
+  if (!redisClient) return;
+
+  try {
+    const key = historyKey(deviceId);
+    const raw = JSON.stringify(assessment);
+    await redisClient.lpush(key, raw);
+    await redisClient.ltrim(key, 0, AI_MAX_HISTORY - 1);
+    console.log('[redis] assessment saved', {
+      deviceId,
+      key,
+      ts: assessment.ts,
+      status: assessment.status,
+    });
+  } catch (error) {
+    console.error('[redis] persist failed:', error?.message || error);
+  }
+}
+
+async function loadAssessmentHistory(deviceId) {
+  if (!redisClient) {
+    console.log('[redis] load history from memory', { deviceId });
+    return memoryHistoryByDevice.get(deviceId) || [];
+  }
+
+  try {
+    const raws = await redisClient.lrange(historyKey(deviceId), 0, AI_MAX_HISTORY - 1);
+    const items = [];
+
+    for (const raw of raws) {
+      try {
+        items.push(JSON.parse(raw));
+      } catch {
+        // Ignore corrupted history item.
+      }
+    }
+
+    console.log('[redis] load history', { deviceId, count: items.length });
+    return items;
+  } catch (error) {
+    console.error('[redis] load history failed:', error?.message || error);
+    return memoryHistoryByDevice.get(deviceId) || [];
+  }
+}
+
+function addReadingForAnalysis(reading) {
+  const deviceId = reading.device_id;
+  const now = Number(reading.gateway_ts || Date.now());
+  const list = recentReadingsByDevice.get(deviceId) || [];
+
+  list.push(reading);
+  const cutoff = now - AI_WINDOW_MS;
+  while (list.length && Number(list[0].gateway_ts || 0) < cutoff) {
+    list.shift();
+  }
+
+  recentReadingsByDevice.set(deviceId, list);
+}
+
+function summarizeWindow(readings) {
+  const spo2 = readings.map((r) => r.spo2).filter(Number.isFinite);
+  const bpm = readings.map((r) => r.bpm).filter(Number.isFinite);
+  const ppg = readings
+    .flatMap((r) => (Array.isArray(r.ppg) ? r.ppg : []))
+    .filter(Number.isFinite)
+    .slice(-800);
+
+  return {
+    sample_count: readings.length,
+    spo2_count: spo2.length,
+    bpm_count: bpm.length,
+    ppg_count: ppg.length,
+    spo2_mean: spo2.length ? Number(average(spo2).toFixed(2)) : null,
+    spo2_min: spo2.length ? Math.min(...spo2) : null,
+    spo2_max: spo2.length ? Math.max(...spo2) : null,
+    bpm_mean: bpm.length ? Number(average(bpm).toFixed(2)) : null,
+    bpm_min: bpm.length ? Math.min(...bpm) : null,
+    bpm_max: bpm.length ? Math.max(...bpm) : null,
+    ppg_std: ppg.length ? Number(stdDev(ppg).toFixed(2)) : null,
+    ppg_p10: ppg.length ? percentile(ppg, 0.1) : null,
+    ppg_p90: ppg.length ? percentile(ppg, 0.9) : null,
+  };
+}
+
+function extractJsonBlock(raw) {
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  return raw.slice(start, end + 1);
+}
+
+function createPrompt(deviceId, summary) {
+  return [
+    `Device: ${deviceId}`,
+    `Summary 30s: ${JSON.stringify(summary)}`,
+    'Assess health status from bpm/spo2/ppg quality and provide diagnosis, warnings, and recommendations.',
+    'Return strict JSON with fields:',
+    '{"status":"stable|warning|critical","confidence":0-1,"summary":"...","diagnosis":"...","warnings":["..."],"recommendations":["..."],"findings":["..."]}',
+    'Use warning if spo2 < 94 or bpm outside 50-120 trend. Use critical if spo2 < 90 or severe instability.',
+  ].join('\n');
+}
+
+function fallbackAssessment(deviceId, summary) {
+  let status = 'stable';
+  if ((summary.spo2_min ?? 100) < 94 || (summary.bpm_max ?? 70) > 120 || (summary.bpm_min ?? 70) < 50) {
+    status = 'warning';
+  }
+  if ((summary.spo2_min ?? 100) < 90) {
+    status = 'critical';
+  }
+
+  return {
+    device_id: deviceId,
+    ts: Date.now(),
+    status,
+    confidence: 0.55,
+    summary: 'Heuristic assessment used because AI response unavailable.',
+    diagnosis: 'Provisional automated assessment from fallback heuristic.',
+    warnings: [
+      `spo2 range: ${summary.spo2_min ?? 'n/a'}-${summary.spo2_max ?? 'n/a'}`,
+      `bpm range: ${summary.bpm_min ?? 'n/a'}-${summary.bpm_max ?? 'n/a'}`,
+      `ppg variability(std): ${summary.ppg_std ?? 'n/a'}`,
+    ],
+    findings: [
+      `spo2 range: ${summary.spo2_min ?? 'n/a'}-${summary.spo2_max ?? 'n/a'}`,
+      `bpm range: ${summary.bpm_min ?? 'n/a'}-${summary.bpm_max ?? 'n/a'}`,
+      `ppg variability(std): ${summary.ppg_std ?? 'n/a'}`,
+    ],
+    recommendations: [
+      'Keep finger stable on sensor and avoid movement.',
+      'Re-check if warning persists for >2 minutes.',
+    ],
+    metrics: summary,
+  };
+}
+
+async function evaluateDevice(deviceId, readings) {
+  const summary = summarizeWindow(readings);
+  console.log('[ai] evaluate start', {
+    deviceId,
+    samples: summary.sample_count,
+    spo2_count: summary.spo2_count,
+    bpm_count: summary.bpm_count,
+    ppg_count: summary.ppg_count,
+  });
+
+  if (!openrouterClient) {
+    console.warn('[ai] openrouter disabled, using fallback', { deviceId });
+    return fallbackAssessment(deviceId, summary);
+  }
+
+  try {
+    const completion = await openrouterClient.chat.completions.create({
+      model: AI_MODEL,
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a clinical monitoring assistant. Respond with JSON only. No markdown.',
+        },
+        {
+          role: 'user',
+          content: createPrompt(deviceId, summary),
+        },
+      ],
+    });
+
+    const content = completion.choices?.[0]?.message?.content || '';
+    const jsonText = extractJsonBlock(content);
+    if (!jsonText) {
+      return fallbackAssessment(deviceId, summary);
+    }
+
+    const parsed = JSON.parse(jsonText);
+    const parsedWarnings = Array.isArray(parsed.warnings)
+      ? parsed.warnings.slice(0, 6).map((x) => String(x))
+      : [];
+    const parsedFindings = Array.isArray(parsed.findings)
+      ? parsed.findings.slice(0, 6).map((x) => String(x))
+      : [];
+
+    const result = {
+      device_id: deviceId,
+      ts: Date.now(),
+      status: ['stable', 'warning', 'critical'].includes(parsed.status)
+        ? parsed.status
+        : 'warning',
+      confidence: Number.isFinite(parsed.confidence)
+        ? clamp(Number(parsed.confidence), 0, 1)
+        : 0.6,
+      summary:
+        typeof parsed.summary === 'string' && parsed.summary.trim()
+          ? parsed.summary.trim()
+          : 'AI assessment completed.',
+      diagnosis:
+        typeof parsed.diagnosis === 'string' && parsed.diagnosis.trim()
+          ? parsed.diagnosis.trim()
+          : (typeof parsed.summary === 'string' ? parsed.summary.trim() : 'No diagnosis provided.'),
+      warnings: parsedWarnings.length ? parsedWarnings : parsedFindings,
+      findings: parsedFindings,
+      recommendations: Array.isArray(parsed.recommendations)
+        ? parsed.recommendations.slice(0, 6).map((x) => String(x))
+        : [],
+      metrics: summary,
+    };
+
+    console.log('[ai] evaluate success', {
+      deviceId,
+      status: result.status,
+      confidence: result.confidence,
+    });
+
+    return result;
+  } catch (error) {
+    console.error('[ai] openrouter error:', error?.message || error);
+    return fallbackAssessment(deviceId, summary);
+  }
+}
+
+async function runAiEvaluationTick() {
+  if (aiEvalInProgress) return;
+  aiEvalInProgress = true;
+  console.log('[ai] tick start', { devices: recentReadingsByDevice.size });
+
+  try {
+    for (const [deviceId, readings] of recentReadingsByDevice.entries()) {
+      if (!hasActiveSubscriber(deviceId)) {
+        console.log('[ai] skip device (no active websocket subscriber)', {
+          deviceId,
+        });
+        continue;
+      }
+
+      if (readings.length < AI_MIN_POINTS) {
+        console.log('[ai] skip device (not enough points)', {
+          deviceId,
+          points: readings.length,
+          min: AI_MIN_POINTS,
+        });
+        continue;
+      }
+
+      const lastTs = Number(readings[readings.length - 1]?.gateway_ts || 0);
+      const lastEvalTs = lastEvalTsByDevice.get(deviceId) || 0;
+      if (lastTs <= lastEvalTs) {
+        console.log('[ai] skip device (no new data)', { deviceId });
+        continue;
+      }
+
+      const assessment = await evaluateDevice(deviceId, readings);
+      lastEvalTsByDevice.set(deviceId, lastTs);
+
+      await persistAssessment(deviceId, assessment);
+      io.to(`device:${deviceId}`).emit('ai-assessment', assessment);
+      console.log('[ai] emitted assessment', {
+        deviceId,
+        status: assessment.status,
+        ts: assessment.ts,
+      });
+    }
+  } finally {
+    console.log('[ai] tick end');
+    aiEvalInProgress = false;
+  }
+}
+
 io.on('connection', (socket) => {
   console.log(`[ws] connected: ${socket.id}`);
 
-  socket.on('subscribe-device', (payload) => {
+  socket.on('subscribe-device', async (payload) => {
     const deviceId = String(payload?.device_id || '').trim();
 
     if (!deviceId) {
@@ -43,6 +434,14 @@ io.on('connection', (socket) => {
     subscriptions.set(socket.id, deviceId);
     socket.join(`device:${deviceId}`);
     socket.emit('subscribed', { device_id: deviceId });
+
+    try {
+      const history = await loadAssessmentHistory(deviceId);
+      socket.emit('ai-history', { device_id: deviceId, items: history });
+    } catch (error) {
+      console.error('[ai] load history error:', error?.message || error);
+      socket.emit('ai-history', { device_id: deviceId, items: [] });
+    }
 
     console.log(`[ws] ${socket.id} subscribed device=${deviceId}`);
   });
@@ -85,20 +484,29 @@ udpServer.on('message', (msg, rinfo) => {
     return;
   }
 
+  const receivedAt = Date.now();
+  const spo2 = toNullableFiniteNumber(payload.spo2);
+  const bpm = toNullableFiniteNumber(payload.bpm);
+
   const reading = {
     device_id: deviceId,
-    spo2: Number(payload.spo2),
-    bpm: Number(payload.bpm),
+    spo2,
+    bpm,
     ppg: Array.isArray(payload.ppg) ? payload.ppg.slice(-256).map(Number) : [],
-    ts: Number(payload.ts || Date.now()),
+    ts: Number(payload.ts || receivedAt),
+    gateway_ts: receivedAt,
     source: `${rinfo.address}:${rinfo.port}`,
   };
 
   io.to(`device:${deviceId}`).emit('sensor-data', reading);
+  addReadingForAnalysis(reading);
 });
 
 udpServer.bind(UDP_PORT, () => {
   const address = udpServer.address();
+
+  setInterval(runAiEvaluationTick, AI_EVAL_INTERVAL_MS);
+  console.log('[ai] scheduler started', { everyMs: AI_EVAL_INTERVAL_MS });
   console.log(`[udp] listening on ${address.address}:${address.port}`);
 });
 
