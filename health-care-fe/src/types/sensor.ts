@@ -2,6 +2,8 @@ export type SensorPacket = {
   device_id: string;
   spo2: number | null;
   bpm: number | null;
+  bp_class?: "normal_bp" | "high_bp" | null;
+  bp_confidence?: number | null;
   ppg: number[];
   ts: number;
   source?: string;

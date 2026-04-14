@@ -38,3 +38,14 @@ coverage/
 
 # ESP32 local secrets/config
 esp32/health_node/local_config.h
+
+# Dataset files
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Python venv
+.venv/

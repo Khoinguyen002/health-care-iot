@@ -32,6 +32,28 @@ function App() {
 
   const spo2Value = latest?.spo2 ?? "--";
   const bpmValue = latest?.bpm ?? "--";
+  const latestAssessment = aiHistory[0];
+  const bpClass =
+    latest?.bp_class ??
+    (latestAssessment
+      ? latestAssessment.status === "stable"
+        ? "normal_bp"
+        : "high_bp"
+      : null);
+  const bpConfidence = latest?.bp_confidence ?? latestAssessment?.confidence ?? null;
+
+  const bpClassLabel =
+    bpClass === "normal_bp"
+      ? "Normal BP"
+      : bpClass === "high_bp"
+        ? "High BP"
+        : "N/A";
+  const bpClassTone =
+    bpClass === "normal_bp"
+      ? "bg-lime-100 text-lime-800 border-lime-200"
+      : bpClass === "high_bp"
+        ? "bg-red-100 text-red-800 border-red-200"
+        : "bg-slate-100 text-slate-700 border-slate-200";
   const dotClass =
     connectionState === "connected"
       ? "bg-lime-700"
@@ -106,7 +128,7 @@ function App() {
         {error ? <p className="m-0 text-sm text-red-700">{error}</p> : null}
       </section>
 
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <section className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
           <p className="m-0 text-sm text-slate-600">SpO2</p>
           <p className="m-0 font-mono text-5xl leading-none text-slate-900">
@@ -120,6 +142,18 @@ function App() {
             {bpmValue}
           </p>
           <p className="m-0 text-sm text-slate-600">BPM</p>
+        </article>
+        <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
+          <p className="m-0 text-sm text-slate-600">BP Classification</p>
+          <p className="m-0 mt-1 text-2xl font-semibold text-slate-900">{bpClassLabel}</p>
+          <p className="m-0 mt-2 text-sm text-slate-600">
+            Confidence: {bpConfidence !== null ? `${Math.round(bpConfidence * 100)}%` : "--"}
+          </p>
+          <p
+            className={`mt-3 inline-flex rounded-lg border px-2.5 py-1 text-xs font-semibold uppercase tracking-[0.06em] ${bpClassTone}`}
+          >
+            {bpClass || "unknown"}
+          </p>
         </article>
       </section>
 

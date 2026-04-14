@@ -564,11 +564,20 @@ udpServer.on('message', (msg, rinfo) => {
   const receivedAt = Date.now();
   const spo2 = toNullableFiniteNumber(payload.spo2);
   const bpm = toNullableFiniteNumber(payload.bpm);
+  const bpClassRaw = String(payload?.bp_class || '')
+    .trim()
+    .toLowerCase();
+  const bpClass = bpClassRaw === 'normal_bp' || bpClassRaw === 'high_bp' ? bpClassRaw : null;
+  const bpConfidenceRaw = toNullableFiniteNumber(payload.bp_confidence);
+  const bpConfidence =
+    bpConfidenceRaw === null ? null : clamp(bpConfidenceRaw, 0, 1);
 
   const reading = {
     device_id: deviceId,
     spo2,
     bpm,
+    bp_class: bpClass,
+    bp_confidence: bpConfidence,
     ppg: Array.isArray(payload.ppg) ? payload.ppg.slice(-256).map(Number) : [],
     ts: Number(payload.ts || receivedAt),
     gateway_ts: receivedAt,
