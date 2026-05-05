@@ -177,9 +177,14 @@ function App() {
 
         <article className="rounded-2xl border border-lime-200 bg-white/80 p-4 shadow-sm">
           <div className="mb-3 flex flex-col gap-1 md:flex-row md:items-baseline md:justify-between">
-            <h2 className="m-0 text-xl font-semibold text-slate-900">
-              AI Assessment History
-            </h2>
+            <div className="flex items-center gap-2">
+              <h2 className="m-0 text-xl font-semibold text-slate-900">
+                Diagnosis History
+              </h2>
+              <span className="inline-flex rounded-md border border-lime-300 bg-lime-100 px-2 py-0.5 text-xs font-semibold text-lime-800 uppercase tracking-wide">
+                Edge Impulse
+              </span>
+            </div>
           </div>
 
           <div className="grid max-h-90 gap-2 overflow-y-auto pr-1">
@@ -194,7 +199,7 @@ function App() {
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
                     <strong>{item.status.toUpperCase()}</strong>
                     <span>confidence: {Math.round((item.confidence || 0) * 100)}%</span>
-                    <span>{new Date(item.ts).toLocaleTimeString()}</span>
+                    <span>{new Date(item.ts).toLocaleString('vi-VN', { dateStyle: 'short', timeStyle: 'medium' })}</span>
                   </div>
                   <p className="m-0 mt-1 text-sm">
                     <strong>Diagnosis:</strong> {item.diagnosis || item.summary}

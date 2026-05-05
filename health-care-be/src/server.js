@@ -14,78 +14,7 @@ const AI_EVAL_INTERVAL_MS = Number(process.env.AI_EVAL_INTERVAL_MS || 30000);
 const AI_WINDOW_MS = Number(process.env.AI_WINDOW_MS || 120000);
 const AI_MIN_POINTS = Number(process.env.AI_MIN_POINTS || 10);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 50);
-const AI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const REDIS_URL = process.env.REDIS_URL || '';
-
-function normalizeGeminiModelName(model) {
-  const raw = String(model || '').trim();
-  if (!raw) return 'models/gemini-2.5-flash';
-  return raw.startsWith('models/') ? raw : `models/${raw}`;
-}
-
-function maskSecret(secret) {
-  if (!secret) return '(empty)';
-  if (secret.length <= 10) return '***';
-  return `${secret.slice(0, 6)}...${secret.slice(-4)}`;
-}
-
-const geminiClient = GEMINI_API_KEY
-  ? {
-      async generate(prompt) {
-        const modelPath = normalizeGeminiModelName(AI_MODEL);
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/${modelPath}:generateContent?key=${encodeURIComponent(
-            GEMINI_API_KEY
-          )}`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  role: 'user',
-                  parts: [{ text: prompt }],
-                },
-              ],
-              generationConfig: {
-                temperature: 0.2,
-              },
-            }),
-          }
-        );
-
-        if (!response.ok) {
-          const body = await response.text();
-          throw new Error(`gemini generateContent failed ${response.status}: ${body}`);
-        }
-
-        const data = await response.json();
-        const content = (data?.candidates?.[0]?.content?.parts || [])
-          .map((part) => String(part?.text || ''))
-          .join('\n')
-          .trim();
-
-        return content;
-      },
-      async getCurrent() {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
-            GEMINI_API_KEY
-          )}`
-        );
-
-        if (!response.ok) {
-          const body = await response.text();
-          throw new Error(`gemini models failed ${response.status}: ${body}`);
-        }
-
-        return response.json();
-      },
-    }
-  : null;
 
 const redisClient = REDIS_URL
   ? new Redis(REDIS_URL, {
@@ -121,13 +50,10 @@ if (redisClient) {
   });
 }
 
-console.log('[ai] config', {
-  enabled: Boolean(geminiClient),
-  model: AI_MODEL,
+console.log('[ei] scheduler config', {
   evalIntervalMs: AI_EVAL_INTERVAL_MS,
   windowMs: AI_WINDOW_MS,
   minPoints: AI_MIN_POINTS,
-  key: maskSecret(GEMINI_API_KEY),
 });
 
 console.log('[redis] config', {
@@ -356,107 +282,99 @@ function fallbackAssessment(deviceId, summary) {
   };
 }
 
-async function evaluateDevice(deviceId, readings) {
+function evaluateDevice(deviceId, readings) {
   const summary = summarizeWindow(readings);
-  console.log('[ai] evaluate start', {
+
+  const eiReadings = readings.filter(
+    (r) => r.bp_class === 'normal_bp' || r.bp_class === 'high_bp'
+  );
+
+  console.log('[ei] evaluate start', {
     deviceId,
-    samples: summary.sample_count,
-    spo2_count: summary.spo2_count,
-    spo2_range: [summary.spo2_min, summary.spo2_max],
-    bpm_count: summary.bpm_count,
-    bpm_range: [summary.bpm_min, summary.bpm_max],
-    ppg_count: summary.ppg_count,
+    total: readings.length,
+    eiWindows: eiReadings.length,
+    spo2_mean: summary.spo2_mean,
+    bpm_mean: summary.bpm_mean,
   });
 
-  if (!geminiClient) {
-    console.warn('[ai] gemini disabled, using fallback', { deviceId });
+  if (!eiReadings.length) {
+    console.warn('[ei] no classified windows yet, using fallback', { deviceId });
     return fallbackAssessment(deviceId, summary);
   }
 
-  try {
-    console.log('[ai] payload to send', {
-      deviceId,
-      spo2_min: summary.spo2_min,
-      spo2_max: summary.spo2_max,
-      spo2_mean: summary.spo2_mean,
-      bpm_min: summary.bpm_min,
-      bpm_max: summary.bpm_max,
-      bpm_mean: summary.bpm_mean,
-    });
+  const highCount = eiReadings.filter((r) => r.bp_class === 'high_bp').length;
+  const normalCount = eiReadings.length - highCount;
+  const highRatio = highCount / eiReadings.length;
+  const avgConf =
+    eiReadings.reduce((s, r) => s + (r.bp_confidence || 0), 0) / eiReadings.length;
 
-    const content = await geminiClient.generate(
-      [
-        'You are a clinical monitoring assistant. Respond with JSON only. No markdown.',
-        createPrompt(deviceId, summary),
-      ].join('\n\n')
-    );
-    const jsonText = extractJsonBlock(content);
-    if (!jsonText) {
-      return fallbackAssessment(deviceId, summary);
-    }
+  const status = highRatio >= 0.85 ? 'critical' : highRatio >= 0.5 ? 'warning' : 'stable';
+  const dominant = highRatio >= 0.5 ? 'high_bp' : 'normal_bp';
 
-    const parsed = JSON.parse(jsonText);
-    const parsedWarnings = Array.isArray(parsed.warnings)
-      ? parsed.warnings.slice(0, 6).map((x) => String(x))
-      : [];
-    const parsedFindings = Array.isArray(parsed.findings)
-      ? parsed.findings.slice(0, 6).map((x) => String(x))
-      : [];
+  const diagnosis =
+    dominant === 'high_bp'
+      ? `High BP detected in ${highCount}/${eiReadings.length} windows (${Math.round(highRatio * 100)}%). Average confidence: ${Math.round(avgConf * 100)}%.`
+      : `Normal BP in ${normalCount}/${eiReadings.length} windows (${Math.round((1 - highRatio) * 100)}%). Average confidence: ${Math.round(avgConf * 100)}%.`;
 
-    const result = {
-      device_id: deviceId,
-      ts: Date.now(),
-      status: ['stable', 'warning', 'critical'].includes(parsed.status)
-        ? parsed.status
-        : 'warning',
-      confidence: Number.isFinite(parsed.confidence)
-        ? clamp(Number(parsed.confidence), 0, 1)
-        : 0.6,
-      summary:
-        typeof parsed.summary === 'string' && parsed.summary.trim()
-          ? parsed.summary.trim()
-          : 'AI assessment completed.',
-      diagnosis:
-        typeof parsed.diagnosis === 'string' && parsed.diagnosis.trim()
-          ? parsed.diagnosis.trim()
-          : (typeof parsed.summary === 'string' ? parsed.summary.trim() : 'No diagnosis provided.'),
-      warnings: parsedWarnings.length ? parsedWarnings : parsedFindings,
-      findings: parsedFindings,
-      recommendations: Array.isArray(parsed.recommendations)
-        ? parsed.recommendations.slice(0, 6).map((x) => String(x))
+  const result = {
+    device_id: deviceId,
+    ts: Date.now(),
+    source: 'edge_impulse',
+    status,
+    confidence: Math.round(avgConf * 100) / 100,
+    summary: `Edge Impulse: ${Math.round(highRatio * 100)}% high_bp — ${eiReadings.length} windows, SpO2 ${summary.spo2_mean ?? 'n/a'}%, BPM ${summary.bpm_mean ?? 'n/a'}`,
+    diagnosis,
+    warnings:
+      dominant === 'high_bp'
+        ? [
+            `${highCount}/${eiReadings.length} windows: high_bp`,
+            `SpO2 range: ${summary.spo2_min ?? 'n/a'}–${summary.spo2_max ?? 'n/a'}%`,
+            `BPM range: ${summary.bpm_min ?? 'n/a'}–${summary.bpm_max ?? 'n/a'}`,
+          ]
         : [],
-      metrics: summary,
-    };
+    findings: [
+      `high_bp: ${highCount} windows (${Math.round(highRatio * 100)}%)`,
+      `normal_bp: ${normalCount} windows`,
+      `avg confidence: ${Math.round(avgConf * 100)}%`,
+      `SpO2 mean: ${summary.spo2_mean ?? 'n/a'}%  |  BPM mean: ${summary.bpm_mean ?? 'n/a'}`,
+    ],
+    recommendations:
+      dominant === 'high_bp'
+        ? [
+            'Rest and re-measure after 5 minutes.',
+            'Avoid stress and caffeine before measuring.',
+            'Consult a doctor if high_bp persists across multiple sessions.',
+          ]
+        : ['Blood pressure is stable. Continue regular monitoring.'],
+    metrics: {
+      ...summary,
+      ei_total_windows: eiReadings.length,
+      ei_high_bp_windows: highCount,
+      ei_normal_bp_windows: normalCount,
+      ei_high_bp_ratio: Math.round(highRatio * 100) / 100,
+    },
+  };
 
-    console.log('[ai] evaluate success', {
-      deviceId,
-      status: result.status,
-      confidence: result.confidence,
-    });
-
-    return result;
-  } catch (error) {
-    console.error('[ai] gemini error:', error?.message || error);
-    return fallbackAssessment(deviceId, summary);
-  }
+  console.log('[ei] evaluate done', { deviceId, status, highRatio, avgConf });
+  return result;
 }
 
 async function runAiEvaluationTick() {
   if (aiEvalInProgress) return;
   aiEvalInProgress = true;
-  console.log('[ai] tick start', { devices: recentReadingsByDevice.size });
+  console.log('[ei] tick start', { devices: recentReadingsByDevice.size });
 
   try {
     for (const [deviceId, readings] of recentReadingsByDevice.entries()) {
       if (!hasActiveSubscriber(deviceId)) {
-        console.log('[ai] skip device (no active websocket subscriber)', {
+        console.log('[ei] skip device (no active websocket subscriber)', {
           deviceId,
         });
         continue;
       }
 
       if (readings.length < AI_MIN_POINTS) {
-        console.log('[ai] skip device (not enough points)', {
+        console.log('[ei] skip device (not enough points)', {
           deviceId,
           points: readings.length,
           min: AI_MIN_POINTS,
@@ -467,11 +385,11 @@ async function runAiEvaluationTick() {
       const lastTs = Number(readings[readings.length - 1]?.gateway_ts || 0);
       const lastEvalTs = lastEvalTsByDevice.get(deviceId) || 0;
       if (lastTs <= lastEvalTs) {
-        console.log('[ai] skip device (no new data)', { deviceId });
+        console.log('[ei] skip device (no new data)', { deviceId });
         continue;
       }
 
-      const assessment = await evaluateDevice(deviceId, readings);
+      const assessment = evaluateDevice(deviceId, readings);
       lastEvalTsByDevice.set(deviceId, lastTs);
 
       await persistAssessment(deviceId, assessment);
@@ -480,14 +398,14 @@ async function runAiEvaluationTick() {
       // Clear all readings that were part of this evaluation, keep only NEW readings
       clearEvaluatedReadings(deviceId, lastTs);
       
-      console.log('[ai] emitted assessment', {
+      console.log('[ei] emitted assessment', {
         deviceId,
         status: assessment.status,
         ts: assessment.ts,
       });
     }
   } finally {
-    console.log('[ai] tick end');
+    console.log('[ei] tick end');
     aiEvalInProgress = false;
   }
 }
@@ -588,24 +506,10 @@ udpServer.on('message', (msg, rinfo) => {
   addReadingForAnalysis(reading);
 });
 
-udpServer.bind(UDP_PORT, async () => {
+udpServer.bind(UDP_PORT, () => {
   const address = udpServer.address();
-
-  try {
-    const keyInfo = await geminiClient?.getCurrent();
-    const modelCount = Array.isArray(keyInfo?.models) ? keyInfo.models.length : 0;
-    if (keyInfo) {
-      console.log('[gemini] key probe success', {
-        modelCount,
-        sampleModels: (keyInfo.models || []).slice(0, 3).map((m) => m.name),
-      });
-    }
-  } catch (error) {
-    console.error('[gemini] key probe failed:', error?.message || error);
-  }
-
   setInterval(runAiEvaluationTick, AI_EVAL_INTERVAL_MS);
-  console.log('[ai] scheduler started', { everyMs: AI_EVAL_INTERVAL_MS });
+  console.log('[ei] scheduler started', { everyMs: AI_EVAL_INTERVAL_MS });
   console.log(`[udp] listening on ${address.address}:${address.port}`);
 });
 
